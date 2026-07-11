@@ -1,6 +1,6 @@
 // ==================== CONFIG ====================
-const UPSTREAM_PRIMARY = 'https://bu0eg1tdzu.cloudflare-gateway.com/dns-query';
-const UPSTREAM_FALLBACK = 'https://rhpcv957tj.cloudflare-gateway.com/dns-query';
+const UPSTREAM_PRIMARY = 'https://akc490p73g.cloudflare-gateway.com/dns-query';
+const UPSTREAM_FALLBACK = 'https://8idy3h05d3.cloudflare-gateway.com/dns-query';
 const UPSTREAM_GEO_BYPASS = 'https://dns.mullvad.net/dns-query'; // Re-resolve without ECS when geo-block returns loopback
 const UPSTREAM_TIMEOUT = 5000;
 
@@ -16,10 +16,10 @@ const ECS_PREFIX_V4 = 24;
 const ECS_PREFIX_V6 = 48;
 
 // Block query types early to save Cloudflare Pages requests
-const BLOCK_ANY = false;    // TYPE 255 — ANY queries
+const BLOCK_ANY = true;    // TYPE 255 — ANY queries
 const BLOCK_AAAA = false;   // TYPE 28  — IPv6 queries
-const BLOCK_PTR = false;    // TYPE 12  — Reverse DNS
-const BLOCK_HTTPS = false;  // TYPE 65  — HTTPS record queries
+const BLOCK_PTR = true;    // TYPE 12  — Reverse DNS
+const BLOCK_HTTPS = true;  // TYPE 65  — HTTPS record queries
 
 // Block private/internal TLDs and router domains
 const BLOCK_PRIVATE_TLD = true;
