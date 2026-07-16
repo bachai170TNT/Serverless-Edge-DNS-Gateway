@@ -18,7 +18,7 @@ const ECS_PREFIX_V6 = 48;
 // Block query types early to save Cloudflare Pages requests
 const BLOCK_ANY = true;    // TYPE 255 — ANY queries
 const BLOCK_AAAA = false;   // TYPE 28  — IPv6 queries
-const BLOCK_PTR = true;    // TYPE 12  — Reverse DNS
+const BLOCK_PTR = true;     // TYPE 12  — Reverse DNS
 const BLOCK_HTTPS = true;  // TYPE 65  — HTTPS record queries
 
 // Block private/internal TLDs and router domains
@@ -662,7 +662,6 @@ function buildRedirectResponse(originalQuery, upstreamResponse, originalDomain, 
   return res.buffer;
 }
 
-
 // ==================== DNS FORWARDING ====================
 async function forwardQuery(query, upstream) {
   const res = await fetch(upstream, {
@@ -719,16 +718,40 @@ async function ensureBlocklistsLoaded(url, context) {
   }
 }
 
+// Helper to hash POST body for Cache Key
+async function sha256(buffer) {
+  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 // ==================== HANDLERS ====================
 async function handleDNSQuery(request, context) {
   const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
-  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Accept' };
+  const cors = { 
+    'Access-Control-Allow-Origin': '*', 
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 
+    'Access-Control-Allow-Headers': 'Content-Type, Accept' 
+  };
 
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
 
+  // ----------------------------------------------------
+  // [BẮT ĐẦU CẤU HÌNH CACHE EDGE]
+  const cache = caches.default;
+  let cacheKey = request;
   let query;
+
   if (request.method === 'POST') {
     query = await request.arrayBuffer();
+    // Băm SHA-256 body của gói tin POST để tạo Cache Key duy nhất
+    const hash = await sha256(query);
+    const cacheUrl = new URL(request.url);
+    cacheUrl.searchParams.set("post-hash", hash);
+    cacheKey = new Request(cacheUrl.toString(), {
+      method: "GET",
+      headers: request.headers
+    });
   } else if (request.method === 'GET') {
     const dns = new URL(request.url).searchParams.get('dns');
     if (!dns) return new Response('Missing dns parameter', { status: 400, headers: cors });
@@ -739,6 +762,16 @@ async function handleDNSQuery(request, context) {
     return new Response('Method not allowed', { status: 405, headers: cors });
   }
 
+  // KIỂM TRA CACHE (Nếu có, trả về ngay lập tức để khử độ trễ Cold-start)
+  let cachedResponse = await cache.match(cacheKey);
+  if (cachedResponse) {
+    const responseWithHeader = new Response(cachedResponse.body, cachedResponse);
+    responseWithHeader.headers.set("X-Cache", "HIT - Serverless Cache");
+    return responseWithHeader;
+  }
+  // [KẾT THÚC CẤU HÌNH CACHE EDGE]
+  // ----------------------------------------------------
+
   // Block unwanted query types early to save upstream requests
   if (BLOCKED_QTYPES.size > 0) {
     const qtype = extractQtype(query);
@@ -748,6 +781,8 @@ async function handleDNSQuery(request, context) {
       });
     }
   }
+
+  let finalResponse;
 
   // Load data if any domain-based filter is enabled
   if (AD_BLOCK_ENABLED || BLOCK_PRIVATE_TLD || DNS_REDIRECT_ENABLED || MULLVAD_UPSTREAM_ENABLED) {
@@ -763,9 +798,10 @@ async function handleDNSQuery(request, context) {
         try {
           const processed = injectECS(query, clientIP);
           const data = await forwardQuery(processed, UPSTREAM_GEO_BYPASS);
-          return new Response(data, {
+          finalResponse = new Response(data, {
             headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Upstream': 'Mullvad' }
           });
+          break;
         } catch {
           return new Response(buildServfail(query), {
             headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Upstream': 'Mullvad-Failed' }
@@ -794,9 +830,10 @@ async function handleDNSQuery(request, context) {
           const rewritten = rewriteQname(query, targetDomain);
           const upstreamData = await resolveQuery(rewritten, clientIP);
           const redirected = buildRedirectResponse(query, upstreamData, domain, targetDomain);
-          return new Response(redirected, {
+          finalResponse = new Response(redirected, {
             headers: { ...cors, 'Content-Type': 'application/dns-message', 'X-Redirected': `${domain} -> ${targetDomain}` }
           });
+          break;
         } catch {
           // Redirect failed, fall through to normal resolution
         }
@@ -804,15 +841,31 @@ async function handleDNSQuery(request, context) {
     }
   }
 
-  // Forward to upstream
-  try {
-    const data = await resolveQuery(query, clientIP);
-    return new Response(data, {
-      headers: { ...cors, 'Content-Type': 'application/dns-message' }
-    });
-  } catch {
-    return new Response('Upstream error', { status: 502, headers: cors });
+  // Forward to upstream if not intercepted
+  if (!finalResponse) {
+    try {
+      const data = await resolveQuery(query, clientIP);
+      finalResponse = new Response(data, {
+        headers: { ...cors, 'Content-Type': 'application/dns-message' }
+      });
+    } catch {
+      return new Response('Upstream error', { status: 502, headers: cors });
+    }
   }
+
+  // ----------------------------------------------------
+  // [LƯU PHẢN HỒI VÀO CACHE TRƯỚC KHI TRẢ VỀ]
+  // Thiết lập TTL lưu Cache trong 60 giây ở Cloudflare Edge
+  let cachedToStore = new Response(finalResponse.body, finalResponse);
+  cachedToStore.headers.set("Cache-Control", "public, max-age=60");
+  cachedToStore.headers.set("X-Cache", "MISS - Fetched and Cached");
+
+  if (context && context.waitUntil) {
+    context.waitUntil(cache.put(cacheKey, cachedToStore.clone()));
+  }
+
+  return cachedToStore;
+  // ----------------------------------------------------
 }
 
 // ==================== ROUTING ====================
@@ -897,10 +950,11 @@ async function handleRequest(request, context) {
     });
   }
 
-  // Unknown route — return 404 (landing page served as static index.html)
   return new Response('Not Found', { status: 404 });
 }
 
-export async function onRequest(context) {
-  return handleRequest(context.request, context);
-}
+export default {
+  async fetch(request, env, context) {
+    return handleRequest(request, context);
+  }
+};
